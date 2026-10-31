@@ -424,23 +424,47 @@ const skVoices=()=>voices.filter(v=>/^sk/i.test(v.lang));
 function bestVoice(){if(S.voice){const v=voices.find(v=>v.name===S.voice);if(v)return v}const sk=skVoices();
  return sk.find(v=>/natural|online|neural/i.test(v.name))||sk.find(v=>/google/i.test(v.name))||sk[0]||voices.find(v=>/^cs/i.test(v.lang))||null}
 function sp(t){const d=document.createElement('div');d.innerHTML=t;let s=d.textContent;
- return s.replace(/\p{Extended_Pictographic}|️|[\u{1F3FB}-\u{1F3FF}]/gu,'').replace(/(\d) (?=\d)/g,'$1')
+ return s.replace(/\p{Extended_Pictographic}|️|[\u{1F3FB}-\u{1F3FF}]/gu,'').replace(/(\d)[   ](?=\d{3}\b)/g,'$1')
+  .replace(/(\d+)\s?€/g,(m,n)=>n+' '+(+n===1?'euro':+n>=2&&+n<=4?'eurá':'eur'))
   .replace(/·/g,' krát ').replace(/ : /g,' delené ').replace(/−/g,' mínus ').replace(/\+/g,' plus ')
   .replace(/ = /g,' sa rovná ').replace(/ < /g,' je menšie ako ').replace(/ > /g,' je väčšie ako ')
-  .replace(/(^|\s)\?(?=\s|$)/g,' koľko ').replace(/\s+/g,' ').trim()}
+  .replace(/(^|\s)\?(?=\s|$)/g,' koľko ').replace(/[ \t\n ]+/g,' ').trim()}
+/* --- nahrané hlasy (audio/index.json + balíky) --- */
+const fnv=s=>{let h=0x811c9dc5;for(const x of new TextEncoder().encode(s)){h^=x;h=Math.imul(h,16777619)>>>0}return h.toString(16).padStart(8,'0')};
+const norm=s=>s.replace(/\s+/g,' ').trim();
+function tokens(part){const out=[];for(const m of part.split(/(\d+)/)){if(!m)continue;
+ if(/^\d+$/.test(m)){const n=+m;if(n>1000&&n%1000){out.push(String(n-n%1000),String(n%1000))}else out.push(String(n))}
+ else{const t=norm(m);if(/[\p{L}]/u.test(t))out.push(t)}}return out}
+const REC={idx:null,files:[],bin:{},buf:new Map()};
+try{fetch('audio/index.json').then(r=>r.ok?r.json():null).then(j=>{if(j&&j.clips){REC.idx=j.clips;REC.files=j.files}}).catch(()=>{})}catch(e){}
+function clipKeys(txt){const keys=[];for(let part of txt.split('|')){part=norm(part);if(!part||!/[\p{L}\p{N}]/u.test(part))continue;const w=fnv(part);
+ if(REC.idx[w]){keys.push(w);continue}for(const t of tokens(part)){const h=fnv(t);if(!REC.idx[h])return null;keys.push(h)}}return keys.length?keys:null}
+function trimBuf(b){const d=b.getChannelData(0),th=.01;let s=0,e=d.length-1;while(s<e&&Math.abs(d[s])<th)s++;while(e>s&&Math.abs(d[e])<th)e--;
+ const pad=Math.floor(b.sampleRate*.045);s=Math.max(0,s-pad);e=Math.min(d.length,e+pad);if(e-s<b.sampleRate*.05)return b;
+ const o=ac().createBuffer(b.numberOfChannels,e-s,b.sampleRate);for(let c=0;c<b.numberOfChannels;c++)o.copyToChannel(b.getChannelData(c).subarray(s,e),c);return o}
+function loadClip(h){if(REC.buf.has(h))return REC.buf.get(h);const[fi,off,len]=REC.idx[h],url='audio/'+REC.files[fi];
+ const raw=REC.bin[fi]?Promise.resolve(REC.bin[fi].slice(off,off+len)):fetch(url,{headers:{Range:`bytes=${off}-${off+len-1}`}}).then(async r=>{
+  if(r.status===206)return r.arrayBuffer();if(r.ok){const all=await r.arrayBuffer();REC.bin[fi]=all;return all.slice(off,off+len)}throw new Error(r.status)});
+ const p=raw.then(b=>new Promise((res,rej)=>ac().decodeAudioData(b,res,rej))).then(trimBuf);REC.buf.set(h,p);p.catch(()=>REC.buf.delete(h));return p}
+let curSrcs=[];
+function playSeq(bs,tok,fin){const c=ac();let t=c.currentTime+.04,last=null;curSrcs=bs.map(b=>{const s=c.createBufferSource();s.buffer=b;s.connect(c.destination);s.start(t);t+=b.duration+.06;last=s;return s});
+ last.onended=()=>{if(tok===sayTok)fin()}}
 let proState=TTS_URL?'unknown':'off',sayTok=0,curSrc=null;const bufs=new Map();
-function stopAll(){sayTok++;try{curSrc&&curSrc.stop()}catch(e){}curSrc=null;try{speechSynthesis.cancel()}catch(e){}}
+function stopAll(){sayTok++;try{curSrc&&curSrc.stop()}catch(e){}curSrc=null;curSrcs.forEach(s=>{try{s.stop()}catch(e){}});curSrcs=[];try{speechSynthesis.cancel()}catch(e){}}
 function getBuf(txt){const k=S.proV+'|'+S.rate+'|'+txt;if(bufs.has(k))return bufs.get(k);
  const p=fetch(`${TTS_URL}?v=${S.proV}&r=${S.rate}&t=${encodeURIComponent(txt)}`).then(r=>{if(!r.ok)throw new Error(r.status);return r.arrayBuffer()})
   .then(b=>new Promise((res,rej)=>ac().decodeAudioData(b,res,rej)));bufs.set(k,p);p.catch(()=>bufs.delete(k));return p}
 const usePro=()=>TTS_URL&&S.pro&&proState!=='fail'&&ac();
+const useRec=()=>S.pro&&REC.idx&&ac();
 function say(t,onend){
- stopAll();const txt=sp(t);const tok=sayTok;if(!txt){onend&&onend();return}
+ stopAll();const txt=sp(t);const tok=sayTok;const plain=norm(txt.replace(/\|/g,' '));if(!plain){onend&&onend();return}
  let done=false;const fin=()=>{if(!done&&tok===sayTok){done=true;onend&&onend()}};
+ if(useRec()){const keys=clipKeys(txt);if(keys){Promise.all(keys.map(loadClip)).then(bs=>{if(tok===sayTok)playSeq(bs,tok,fin)}).catch(()=>{if(tok===sayTok)sayFallback(plain,tok,fin)});return}}
+ sayFallback(plain,tok,fin)}
+function sayFallback(txt,tok,fin){
  if(usePro()){getBuf(txt).then(buf=>{if(tok!==sayTok)return;proState='ok';const s=ac().createBufferSource();s.buffer=buf;s.connect(ac().destination);s.onended=()=>{if(curSrc===s)curSrc=null;fin()};curSrc=s;s.start()})
    .catch(()=>{proState='fail';if(tok===sayTok)sayDevice(txt,fin)});return}
- sayDevice(txt,fin);
-}
+ sayDevice(txt,fin)}
 function sayDevice(txt,fin){
  if(!('speechSynthesis' in window)){setTimeout(fin,Math.max(1800,txt.length*65));return}
  const u=new SpeechSynthesisUtterance(txt);u.lang='sk-SK';const v=bestVoice();if(v){u.voice=v;u.lang=v.lang}
@@ -448,7 +472,7 @@ function sayDevice(txt,fin){
  setTimeout(fin,Math.max(2500,txt.length*95/S.rate));
 }
 const autoSay=t=>{if(S.auto)say(t)};
-function prefetch(t){if(usePro()&&proState==='ok')getBuf(sp(t)).catch(()=>{})}
+function prefetch(t){if(!t)return;if(useRec()){const k=clipKeys(sp(t));k&&k.forEach(h=>loadClip(h).catch(()=>{}))}else if(usePro()&&proState==='ok')getBuf(norm(sp(t).replace(/\|/g,' '))).catch(()=>{})}
 
 /* ===================== slovník ===================== */
 const GL={
@@ -483,7 +507,7 @@ function showTip(k){const g=GL[k];if(!g)return;const tip=$('#tip');const t=k+'. 
 document.addEventListener('click',e=>{const t=e.target.closest('.term');if(t){e.stopPropagation();showTip(t.dataset.t)}else if(!e.target.closest('.tip'))$('#tip').classList.remove('on')});
 
 /* ===================== pomocníci na vizualizácie ===================== */
-const ITEMS=[['🍎','jablko','jablká','jabĺk'],['🍓','jahoda','jahody','jahôd'],['⭐','hviezdička','hviezdičky','hviezdičiek'],['🌸','kvietok','kvietky','kvietkov'],['🐟','rybka','rybky','rybiek'],['🎈','balón','balóny','balónov'],['🐥','kuriatko','kuriatka','kuriatok'],['🍒','čerešňa','čerešne','čerešní'],['🥕','mrkva','mrkvy','mrkiev'],['🐞','lienka','lienky','lienok']];
+const ITEMS=[['🍎','jablko','jablká','jabĺk'],['🍓','jahoda','jahody','jahôd'],['⭐','hviezdička','hviezdičky','hviezdičiek'],['🌸','kvietok','kvietky','kvietkov'],['🐟','rybka','rybky','rybiek'],['🎈','balón','balóny','balónov'],['🐥','kuriatko','kuriatka','kuriatok'],['🍊','pomaranč','pomaranče','pomarančov'],['🥕','mrkva','mrkvy','mrkiev'],['🐞','lienka','lienky','lienok']];
 const itemW=(it,n)=>pl(n,it[1],it[2],it[3]);
 function frames(cells){ // cells: pole tried
  let h='<div class="frames">';for(let f=0;f<Math.max(1,Math.ceil(cells.length/10));f++){h+='<div class="frame">';for(let i=0;i<10;i++)h+=`<i class="${cells[f*10+i]||''}"></i>`;h+='</div>'}return h+'</div>';
@@ -1166,7 +1190,7 @@ function renderHome(){
   h+='</div></div>'});
  $('#map').innerHTML=h;
 }
-$('#grades').onclick=e=>{const b=e.target.closest('button');if(!b)return;S.grade=+b.dataset.g;save();renderHome();SFX.tap();say(`${S.grade}. ročník. Čísla ${GRADES[S.grade-1][2]}.`)};
+$('#grades').onclick=e=>{const b=e.target.closest('button');if(!b)return;S.grade=+b.dataset.g;save();renderHome();SFX.tap();say(['','Prvý ročník. Čísla do dvadsať.','Druhý ročník. Čísla do sto.','Tretí ročník. Čísla do tisíc.'][S.grade])};
 $('#map').onclick=e=>{const i=e.target.closest('[data-intro]');if(i){playIntro(WORLDS.find(w=>w.id===i.dataset.intro));return}
  const n=e.target.closest('.node');if(!n)return;if(n.classList.contains('lockn')){say('Túto časť pre teba ešte chystám.');return}
  curW=WORLDS.find(w=>w.id===n.dataset.w);SFX.tap();
@@ -1197,18 +1221,18 @@ function nextTask(){
  $('#gQ').innerHTML=t.q;$('#gVis').innerHTML=t.vis;
  const o=$('#gOpts');const th=t.three!==undefined?t.three:gm.three;o.className='opts'+(th?' three':'')+(gm.two&&!th?' two':'');
  o.innerHTML=t.opts.map(v=>`<button class="opt b3 ${t.txt?'txt':''} ${t.pic?'pic':''}" data-v="${v}">${t.label?t.label(v):fmt(v)}</button>`).join('');
- autoSay(t.say||t.q);prefetch(t.explain);
+ autoSay(t.say||t.q);prefetch(t.explain);prefetch(t.hint);
 }
 const val=(t,x)=>typeof t.ans==='number'?+x.dataset.v:x.dataset.v;
 $('#gOpts').onclick=e=>{const b=e.target.closest('.opt');if(!b||R.done||b.disabled)return;const t=R.task;
  if(val(t,b)===t.ans){b.classList.add('ok');R.done=true;if(R.res.length<R.i)R.res.push(R.tries===0);
   R.streak=R.tries===0?R.streak+1:0;R.best=Math.max(R.best,R.streak);fillAns(t);disableAll();SFX.ok();mood($('#gBod'),'happy');confetti(b);
   const p=pick(PRAISE);sheet('ok',p,R.tries?t.explain:(R.streak>=3?`${R.streak} správne za sebou! 🔥`:''),'Pokračovať');
-  setTimeout(()=>say(p+(R.tries?' '+t.explain:'')),220);if(t.after)t.after(()=>{})}
+  setTimeout(()=>say(p+(R.tries?'|'+t.explain:'')),220);if(t.after)t.after(()=>{})}
  else{b.classList.add('bad');b.disabled=true;R.tries++;R.streak=0;SFX.no();mood($('#gBod'),'sad');
-  if(R.tries===1){R.mistakes++;const m=pick(TRY),hh=t.hintFor?t.hintFor(val(t,b)):(t.hint||'');sheet('try',m,hh,'Skúsiť znova');say(m+' '+hh)}
+  if(R.tries===1){R.mistakes++;const m=pick(TRY),hh=t.hintFor?t.hintFor(val(t,b)):(t.hint||'');sheet('try',m,hh,'Skúsiť znova');say(m+'|'+hh)}
   else{R.done=true;if(R.res.length<R.i)R.res.push(false);const right=[...$('#gOpts').children].find(x=>val(t,x)===t.ans);right&&right.classList.add('ok');
-   fillAns(t);disableAll();sheet('no','Pozri sa, ako na to',t.explain,'Rozumiem');say('Pozri sa, ako na to. '+t.explain);if(t.after)t.after(()=>{})}}
+   fillAns(t);disableAll();sheet('no','Pozri sa, ako na to',t.explain,'Rozumiem');say('Pozri sa, ako na to.|'+t.explain);if(t.after)t.after(()=>{})}}
 };
 function disableAll(){$('#gOpts').querySelectorAll('.opt').forEach(x=>x.disabled=true)}
 function fillAns(t){const bx=$('#ansBox');if(bx){bx.classList.add('fill');bx.innerHTML=t.label?t.label(t.ans):fmt(t.ans)}}
@@ -1228,7 +1252,7 @@ function finish(){
  const txt=st===3?'Úžasné! Všetko na prvý pokus!':st===2?'Výborná práca! Ešte kúsok a máš tri hviezdičky.':'Dobre! Skús to ešte raz, pôjde to lepšie.';
  $('#finT').textContent=st===3?'Si hviezda!':'Kolo dokončené!';$('#finP').textContent=txt;
  $('#finStats').innerHTML=`<div class="stat" style="--c:var(--g)"><b>Presnosť</b><span>${Math.round(good/R.n*100)} %</span></div><div class="stat" style="--c:var(--o)"><b>Séria</b><span>🔥 ${R.best}</span></div><div class="stat" style="--c:var(--b)"><b>Čas</b><span>${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')}</span></div>`;
- show('finish');SFX.win();setTimeout(()=>say(`${st===3?'Si hviezda!':'Kolo dokončené!'} Máš ${st} ${pl(st,'hviezdičku','hviezdičky','hviezdičiek')}. ${txt}`),500);
+ show('finish');SFX.win();setTimeout(()=>say(`${st===3?'Si hviezda!':'Kolo dokončené!'}|${['','Máš jednu hviezdičku.','Máš dve hviezdičky.','Máš tri hviezdičky.'][st]}|${txt}`),500);
  for(let i=0;i<(st===3?4:1);i++)setTimeout(()=>confetti($('#finS')),i*300);
 }
 $('#finAgain').onclick=()=>startGame(R.gid);$('#finBack').onclick=()=>{setBg('luka');renderHome();show('home')};
@@ -1241,10 +1265,11 @@ $('#ov').onclick=e=>{if(e.target.id==='ov'||e.target.closest('.close'))$('#ov').
 function openSettings(){
  loadVoices();const sk=skVoices(),cur=bestVoice();
  const dv=(sk.length?sk:voices.filter(v=>/^(sk|cs)/i.test(v.lang))).map(v=>`<option ${cur&&cur.name===v.name?'selected':''}>${v.name}</option>`).join('');
- const proInfo=!TTS_URL?'<div class="note">Profesionálny hlas zatiaľ nie je pripojený, používa sa hlas zariadenia.</div>':proState==='fail'?'<div class="note">Profesionálny hlas je teraz nedostupný, používa sa hlas zariadenia.</div>':'<div class="note ok">✓ Bodka hovorí profesionálnym hlasom.</div>';
+ const proInfo=REC.idx?(S.pro?'<div class="note ok">✓ Bodka hovorí nahratým hlasom.</div>':'<div class="note">Nahraný hlas je vypnutý, používa sa hlas zariadenia.</div>'):!TTS_URL?'<div class="note">Profesionálny hlas zatiaľ nie je pripojený, používa sa hlas zariadenia.</div>':proState==='fail'?'<div class="note">Profesionálny hlas je teraz nedostupný, používa sa hlas zariadenia.</div>':'<div class="note ok">✓ Bodka hovorí profesionálnym hlasom.</div>';
  modal(`<h2>⚙️ Nastavenia</h2>
  <div class="row">🔊 Čítať úlohy automaticky<button class="sw ${S.auto?'on':''}" data-k="auto" aria-label="Automatické čítanie"></button></div>
  <div class="row">🎵 Zvukové efekty<button class="sw ${S.sfx?'on':''}" data-k="sfx" aria-label="Zvukové efekty"></button></div>
+ ${REC.idx&&!TTS_URL?`<div class="row">🎙️ Nahraný hlas Bodky<button class="sw ${S.pro?'on':''}" data-k="pro" aria-label="Nahraný hlas"></button></div>`:''}
  ${TTS_URL?`<div class="row">🎙️ Profesionálny hlas<button class="sw ${S.pro?'on':''}" data-k="pro" aria-label="Profesionálny hlas"></button></div>
  <div class="row">Hlas Bodky<select id="selP"><option value="f" ${S.proV==='f'?'selected':''}>ženský</option><option value="m" ${S.proV==='m'?'selected':''}>mužský</option></select></div>`:''}
  <div class="row">🗣️ Hlas zariadenia<select id="selV">${dv||'<option>predvolený</option>'}</select></div>
